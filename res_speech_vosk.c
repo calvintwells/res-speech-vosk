@@ -414,7 +414,7 @@ static int load_module(void)
 		ast_log(LOG_ERROR, "Failed to alloc media format capabilities\n");
 		return AST_MODULE_LOAD_FAILURE;
 	}
-	ast_format_cap_append(ast_engine.formats, ast_format_slin16, 0);
+	ast_format_cap_append(ast_engine.formats, ast_format_slin, 0);
 
 	if (ast_speech_register(&ast_engine)) {
 		ast_log(LOG_ERROR, "Failed to register module\n");
