@@ -41,6 +41,7 @@
 
 #include <asterisk/http_websocket.h>
 
+
 #define VOSK_ENGINE_NAME "vosk"
 #define VOSK_ENGINE_CONFIG "res_speech_vosk.conf"
 #define VOSK_BUF_SIZE 3200
@@ -467,14 +468,14 @@ static int load_module(void)
         }
 
         /* ONE-TIME WARNING about channel metadata requirement */        
-        ast_log(LOG_NOTICE, 
+        ast_log(LOG_NOTICE,
             "Vosk Speech Recognition loaded. "
             "NOTE: For channel metadata in AMI events, add to dialplan:\n"
-            "      same => n,SpeechCreate(vosk)
-            "      same => n,Set(SPEECH_ENGINE(channel)=${CHANNEL})
-            "      same => n,Set(SPEECH_ENGINE(uniqueid)=${UNIQUEID})            
-            "      Events will show 'not_set_in_dialplan' if omitted.\n");            
-        
+            "      same => n,SpeechCreate(vosk)\n"
+            "      same => n,Set(SPEECH_ENGINE(channel)=${CHANNEL})\n"
+            "      same => n,Set(SPEECH_ENGINE(uniqueid)=${UNIQUEID})\n"
+            "      Events will show 'not_set_in_dialplan' if omitted.\n");
+                
         ast_engine.formats = ast_format_cap_alloc(AST_FORMAT_CAP_FLAG_DEFAULT);
         if (!ast_engine.formats) {
                 ast_log(LOG_ERROR, "Failed to alloc media format capabilities\n");
