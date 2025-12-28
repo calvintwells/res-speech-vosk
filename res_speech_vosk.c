@@ -219,26 +219,33 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                         ast_free(vosk_speech->last_result);
                         vosk_speech->last_result = ast_strdup(partial);
 
-                        /* Calculate how many MS have passed since we started listening */
-                        long ms_offset = ast_tvdiff_ms(ast_tvnow(), vosk_speech->start_time);
-
-                        /* NOTE: Channel metadata will only be captured if the dialplan sets:
-                         *   same => n,Set(SPEECH_ENGINE(channel)=${CHANNEL})
-                         *   same => n,Set(SPEECH_ENGINE(uniqueid)=${UNIQUEID})
-                         * after calling SpeechCreate(vosk).
-                         * Otherwise, diagnostic placeholders will appear in AMI events.
-                         */
-                        
-                        if (strlen(partial) < 2500) {
-                                manager_event(EVENT_FLAG_REPORTING, "VoskPartial",
-                                    "Channel: %s\r\n"
-                                    "Uniqueid: %s\r\n"
-                                    "TimeCode: %ld\r\n"
-                                    "PartialText: %s\r\n",
-                                    vosk_speech->chan_name[0] ? vosk_speech->chan_name : "not_set_in_dialplan",
-                                    vosk_speech->chan_uniqueid[0] ? vosk_speech->chan_uniqueid : "not_set_in_dialplan",
-                                    ms_offset,
-                                    partial);
+                        /* Only emit when partial changes (dedupe) */
+                        if (!vosk_speech->last_partial_sent || strcmp(vosk_speech->last_partial_sent, partial) != 0) {
+                                
+                                ast_free(vosk_speech->last_partial_sent);
+                                vosk_speech->last_partial_sent = ast_strdup(partial);
+                                
+                                /* Calculate how many MS have passed since we started listening */
+                                long ms_offset = ast_tvdiff_ms(ast_tvnow(), vosk_speech->start_time);
+        
+                                /* NOTE: Channel metadata will only be captured if the dialplan sets:
+                                 *   same => n,Set(SPEECH_ENGINE(channel)=${CHANNEL})
+                                 *   same => n,Set(SPEECH_ENGINE(uniqueid)=${UNIQUEID})
+                                 * after calling SpeechCreate(vosk).
+                                 * Otherwise, diagnostic placeholders will appear in AMI events.
+                                 */
+                                
+                                if (strlen(partial) < 2500) {
+                                        manager_event(EVENT_FLAG_REPORTING, "VoskPartial",
+                                            "Channel: %s\r\n"
+                                            "Uniqueid: %s\r\n"
+                                            "TimeCode: %ld\r\n"
+                                            "PartialText: %s\r\n",
+                                            vosk_speech->chan_name[0] ? vosk_speech->chan_name : "not_set_in_dialplan",
+                                            vosk_speech->chan_uniqueid[0] ? vosk_speech->chan_uniqueid : "not_set_in_dialplan",
+                                            ms_offset,
+                                            partial);
+                                }
                         }
 
                 } else if (text && !ast_strlen_zero(text)) {
