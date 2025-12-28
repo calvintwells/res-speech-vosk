@@ -368,10 +368,30 @@ static int vosk_recog_start(struct ast_speech *speech)
 /** \brief Change an engine specific setting */
 static int vosk_recog_change(struct ast_speech *speech, const char *name, const char *value)
 {
-        vosk_speech_t *vosk_speech = speech->data;
-        ast_debug(1, "(%s) Change setting name: %s value:%s\n", vosk_speech->name, name, value);
+    vosk_speech_t *vosk_speech = speech ? speech->data : NULL;
+
+    if (!vosk_speech || ast_strlen_zero(name)) {
+        return -1;
+    }
+
+    ast_debug(2, "(%s) Change setting name: %s value:%s\n",
+              vosk_speech->name, name, S_OR(value, ""));
+
+    if (!strcasecmp(name, "channel")) {
+        ast_copy_string(vosk_speech->chan_name, S_OR(value, ""),
+                        sizeof(vosk_speech->chan_name));
         return 0;
+    }
+
+    if (!strcasecmp(name, "uniqueid")) {
+        ast_copy_string(vosk_speech->chan_uniqueid, S_OR(value, ""),
+                        sizeof(vosk_speech->chan_uniqueid));
+        return 0;
+    }
+
+    return 0;
 }
+
 
 /** \brief Get an engine specific attribute */
 static int vosk_recog_get_settings(struct ast_speech *speech, const char *name, char *buf, size_t len)
