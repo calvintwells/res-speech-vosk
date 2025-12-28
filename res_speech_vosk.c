@@ -221,9 +221,9 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                         long ms_offset = ast_tvdiff_ms(ast_tvnow(), vosk_speech->start_time);
 
                         /* NOTE: Channel metadata will only be captured if the dialplan sets:
-                         *   same => n,Set(__SPEECH_CHANNEL=${CHANNEL})
-                         *   same => n,Set(__SPEECH_UNIQUEID=${UNIQUEID})
-                         * before calling SpeechCreate(vosk).
+                         *   same => n,Set(SPEECH_ENGINE(channel)=${CHANNEL})
+                         *   same => n,Set(SPEECH_ENGINE(uniqueid)=${UNIQUEID})
+                         * after calling SpeechCreate(vosk).
                          * Otherwise, diagnostic placeholders will appear in AMI events.
                          */
                         
@@ -470,9 +470,9 @@ static int load_module(void)
         ast_log(LOG_NOTICE, 
             "Vosk Speech Recognition loaded. "
             "NOTE: For channel metadata in AMI events, add to dialplan:\n"
-            "      Set(__SPEECH_CHANNEL=${CHANNEL})\n"
-            "      Set(__SPEECH_UNIQUEID=${UNIQUEID})\n"
-            "      before SpeechCreate(vosk).\n"
+            "      same => n,SpeechCreate(vosk)
+            "      same => n,Set(SPEECH_ENGINE(channel)=${CHANNEL})
+            "      same => n,Set(SPEECH_ENGINE(uniqueid)=${UNIQUEID})            
             "      Events will show 'not_set_in_dialplan' if omitted.\n");            
         
         ast_engine.formats = ast_format_cap_alloc(AST_FORMAT_CAP_FLAG_DEFAULT);
