@@ -164,9 +164,10 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                                 ast_log(LOG_WARNING,
                                         "(%s) WebSocket write failed (pre-flush)\n",
                                         vosk_speech->name);
-                        }
-                        vosk_speech->offset = 0;
-                }
+                        }                        
+                } 
+                /* Always reset offset after detecting overflow */
+                vosk_speech->offset = 0;
         }
 
         memcpy(vosk_speech->buf + vosk_speech->offset, data, len);
