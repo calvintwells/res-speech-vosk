@@ -83,6 +83,9 @@ struct vosk_speech_t {
         unsigned int            overflow_events;
 };
 
+/* Forward declaration for lazy-connect helper */
+static int vosk_try_connect(vosk_speech_t *vosk_speech);
+
 /** \brief Declaration of Vosk recognition engine */
 struct vosk_engine_t {
         /* Websocket url*/
