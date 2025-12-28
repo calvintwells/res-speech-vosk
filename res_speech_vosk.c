@@ -117,10 +117,16 @@ static int vosk_recog_create(struct ast_speech *speech, struct ast_format *forma
 
         vosk_speech->ws = ast_websocket_client_create(vosk_engine.ws_url, "ws", NULL, &result);
         if (!vosk_speech->ws) {
-                ast_free(speech->data);
-                speech->data = NULL;
-                return -1;
+                ast_log(LOG_WARNING,
+                    "(%s) Initial websocket connect failed, engine in FAILED state (lazy connect enabled)\n",
+                    vosk_speech->name);
+        
+                vosk_speech->state = VOSK_STATE_FAILED;
+        
+                /* DO NOT free speech->data — keep engine alive for retry */
+                return 0;  /* SpeechCreate succeeds */
         }
+
 
         ast_debug(1, "(%s) Created speech resource result %d\n", vosk_speech->name, result);
 
@@ -157,11 +163,25 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
         int res_len;
         int rc = 0;
 
-        /* Avoid early returns that could break lock symmetry */
-        if (!vosk_speech || !vosk_speech->ws) {
+        if (!vosk_speech) {
                 rc = -1;
                 goto out_no_unlock;
         }
+
+        /* Attempt lazy-connect if websocket is not connected */
+        if (vosk_speech->state != VOSK_STATE_CONNECTED || !vosk_speech->ws) {
+                if (vosk_try_connect(vosk_speech) < 0) {
+                        /* Still failed — silently ignore audio until server comes up */
+                        return 0;
+                }
+        }
+
+        /* Avoid early returns that could break lock symmetry */
+        if (!vosk_speech->ws) {
+                rc = -1;
+                goto out_no_unlock;
+        }
+
 
         if (len <= 0) {
                 rc = 0;
@@ -373,11 +393,64 @@ static int vosk_recog_dtmf(struct ast_speech *speech, const char *dtmf)
         return 0;
 }
 
+/* Attempt to establish websocket connection if engine is FAILED or INIT */
+static int vosk_try_connect(vosk_speech_t *vosk_speech)
+{
+    enum ast_websocket_result result;
+    int attempts = 0;
+
+    if (!vosk_speech) {
+        return -1;
+    }
+
+    /* Only try if not already connected */
+    if (vosk_speech->state == VOSK_STATE_CONNECTED && vosk_speech->ws) {
+        return 0;
+    }
+
+    /* Clear any stale pointer */
+    vosk_speech->ws = NULL;
+
+    while (attempts < 3) {
+        vosk_speech->ws = ast_websocket_client_create(
+            vosk_engine.ws_url, "ws", NULL, &result);
+
+        if (vosk_speech->ws) {
+            ast_log(LOG_NOTICE,
+                "(%s) Lazy-connect succeeded after %d attempt(s)\n",
+                vosk_speech->name, attempts + 1);
+
+            vosk_speech->state = VOSK_STATE_CONNECTED;
+            return 0;
+        }
+
+        attempts++;
+        usleep(200000); /* 200 ms */
+    }
+
+    ast_log(LOG_WARNING,
+        "(%s) Lazy-connect failed after 3 attempts\n",
+        vosk_speech->name);
+
+    vosk_speech->state = VOSK_STATE_FAILED;
+    return -1;
+}
+
 /** brief Prepare engine to accept audio */
 static int vosk_recog_start(struct ast_speech *speech)
 {
         vosk_speech_t *vosk_speech = speech->data;
-       
+
+        /* Attempt lazy-connect if not already connected */
+        if (vosk_speech->state != VOSK_STATE_CONNECTED) {
+                if (vosk_try_connect(vosk_speech) < 0) {
+                        ast_log(LOG_WARNING,
+                                "(%s) SpeechStart: websocket still unavailable (lazy-connect)\n",
+                                vosk_speech->name);
+                        /* Continue anyway — engine stays alive and will retry later */
+                }
+        }
+
         /* Mark the 'Zero' point for timecodes */
         vosk_speech->start_time = ast_tvnow();
 
@@ -385,6 +458,7 @@ static int vosk_recog_start(struct ast_speech *speech)
         ast_speech_change_state(speech, AST_SPEECH_STATE_READY);
         return 0;
 }
+
 
 /** \brief Change an engine specific setting */
 static int vosk_recog_change(struct ast_speech *speech, const char *name, const char *value)
