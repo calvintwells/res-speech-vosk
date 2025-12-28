@@ -348,15 +348,7 @@ static int vosk_recog_dtmf(struct ast_speech *speech, const char *dtmf)
 static int vosk_recog_start(struct ast_speech *speech)
 {
         vosk_speech_t *vosk_speech = speech->data;
-
-        /* CAPTURE CHANNEL METADATA ONCE */
-        struct ast_channel *chan = ast_channel_get_by_name_prefix(NULL, 0);
-        if (chan) {
-                ast_copy_string(vosk_speech->chan_name, ast_channel_name(chan), sizeof(vosk_speech->chan_name));
-                ast_copy_string(vosk_speech->chan_uniqueid, ast_channel_uniqueid(chan), sizeof(vosk_speech->chan_uniqueid));
-                ast_channel_unref(chan);
-        }
-
+       
         /* Mark the 'Zero' point for timecodes */
         vosk_speech->start_time = ast_tvnow();
 
