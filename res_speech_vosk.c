@@ -232,8 +232,8 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                                     "Uniqueid: %s\r\n"
                                     "TimeCode: %ld\r\n"
                                     "PartialText: %s\r\n",
-                                    vosk_speech->chan_name[0] ? vosk_speech->chan_name : "__CHANNEL_NOT_SET_IN_DIALPLAN__",
-                                    vosk_speech->chan_uniqueid[0] ? vosk_speech->chan_uniqueid : "__UNIQUEID_NOT_SET_IN_DIALPLAN__",
+                                    vosk_speech->chan_name[0] ? vosk_speech->chan_name : "not_set_in_dialplan",
+                                    vosk_speech->chan_uniqueid[0] ? vosk_speech->chan_uniqueid : "not_set_in_dialplan",
                                     ms_offset,
                                     partial);
                         }
