@@ -65,6 +65,7 @@ struct vosk_speech_t {
         struct timeval          start_time; /* THE TIME KEEPER */
         char                    chan_name[AST_CHANNEL_NAME]; /* Added this */
         char                    chan_uniqueid[AST_MAX_UNIQUEID]; /* Added this */
+        char *last_partial_sent;   /* dedupe: last partial we emitted to AMI */
 };
 
 /** \brief Declaration of Vosk recognition engine */
@@ -307,6 +308,7 @@ static int vosk_recog_destroy(struct ast_speech *speech)
         }
 
         ast_free(vosk_speech->last_result);
+        ast_free(vosk_speech->last_partial_sent);
         ast_free(vosk_speech);
         speech->data = NULL;
 
