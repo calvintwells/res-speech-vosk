@@ -52,6 +52,14 @@ typedef struct vosk_speech_t vosk_speech_t;
 /** \brief Forward declaration of engine (global object) */
 typedef struct vosk_engine_t vosk_engine_t;
 
+/** \brief Engine state for robustness and diagnostics */
+enum vosk_state { 
+        VOSK_STATE_INIT = 0,
+        VOSK_STATE_CONNECTED,
+        VOSK_STATE_FAILED,
+        VOSK_STATE_CLOSED,
+};
+
 /** \brief Declaration of Vosk speech structure */
 struct vosk_speech_t {
         /* Name of the speech object to be used for logging */
@@ -63,9 +71,16 @@ struct vosk_speech_t {
         int                     offset;
         char                    *last_result;
         struct timeval          start_time; /* THE TIME KEEPER */
-        char                    chan_name[AST_CHANNEL_NAME]; /* Added this */
+        char                    chan_name[AST_CHANNEL_NAME];     /* Added this */
         char                    chan_uniqueid[AST_MAX_UNIQUEID]; /* Added this */
-        char *last_partial_sent;   /* dedupe: last partial we emitted to AMI */
+        char                    *last_partial_sent;              /* dedupe: last partial we emitted to AMI */
+
+        /* Engine state and basic error counters */
+        enum vosk_state         state;
+        unsigned int            send_errors;
+        unsigned int            recv_errors;
+        unsigned int            json_errors;
+        unsigned int            overflow_events;
 };
 
 /** \brief Declaration of Vosk recognition engine */
@@ -83,16 +98,20 @@ static int vosk_recog_create(struct ast_speech *speech, struct ast_format *forma
         vosk_speech_t *vosk_speech;
         enum ast_websocket_result result;
 
-
         vosk_speech = ast_calloc(1, sizeof(*vosk_speech));
         if (!vosk_speech) {
                 return -1;
         }
 
-
-
         vosk_speech->name = "vosk";
         speech->data = vosk_speech;
+
+        /* Initial state before websocket connect attempt */
+        vosk_speech->state = VOSK_STATE_INIT;
+        vosk_speech->send_errors = 0;
+        vosk_speech->recv_errors = 0;
+        vosk_speech->json_errors = 0;
+        vosk_speech->overflow_events = 0;
 
         ast_debug(1, "(%s) Create speech resource %s\n", vosk_speech->name, vosk_engine.ws_url);
 
