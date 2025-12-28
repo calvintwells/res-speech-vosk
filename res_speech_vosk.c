@@ -45,7 +45,6 @@
 #define VOSK_ENGINE_CONFIG "res_speech_vosk.conf"
 #define VOSK_BUF_SIZE 3200
 
-static int vosk_channel_warning_logged = 0;
 
 /** \brief Forward declaration of speech (client object) */
 typedef struct vosk_speech_t vosk_speech_t;
@@ -456,17 +455,14 @@ static int load_module(void)
                 return AST_MODULE_LOAD_DECLINE;
         }
 
-        /* ONE-TIME WARNING about channel metadata requirement */
-        if (!vosk_channel_warning_logged) {
+        /* ONE-TIME WARNING about channel metadata requirement */        
         ast_log(LOG_NOTICE, 
             "Vosk Speech Recognition loaded. "
             "NOTE: For channel metadata in AMI events, add to dialplan:\n"
             "      Set(__SPEECH_CHANNEL=${CHANNEL})\n"
             "      Set(__SPEECH_UNIQUEID=${UNIQUEID})\n"
             "      before SpeechCreate(vosk).\n"
-            "      Events will show 'not_set_in_dialplan' if omitted.\n");
-            vosk_channel_warning_logged = 1;
-        }
+            "      Events will show 'not_set_in_dialplan' if omitted.\n");            
         
         ast_engine.formats = ast_format_cap_alloc(AST_FORMAT_CAP_FLAG_DEFAULT);
         if (!ast_engine.formats) {
