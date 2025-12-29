@@ -445,17 +445,109 @@ static int vosk_recog_change_results_type(struct ast_speech *speech, enum ast_sp
         return -1;
 }
 
-/** \brief Try to get result */
+/** \brief Try to get result (also drains websocket nonblocking) */
 struct ast_speech_result *vosk_recog_get(struct ast_speech *speech)
 {
+        vosk_speech_t *vosk_speech;
         struct ast_speech_result *speech_result;
 
-        vosk_speech_t *vosk_speech = speech->data;
-        speech_result = ast_calloc(sizeof(struct ast_speech_result), 1);
-        speech_result->text = ast_strdup(vosk_speech->last_result);
+        if (!speech || !(vosk_speech = speech->data)) {
+                return NULL;
+        }
+
+        /* If websocket is down, optionally try to reconnect */
+        if (vosk_speech->state != VOSK_STATE_CONNECTED || !vosk_speech->ws) {
+                (void)vosk_try_connect(vosk_speech);
+        }
+
+        /* Take a local ref so destroy() can't free the ws out from under us */
+        struct ast_websocket *ws = vosk_speech->ws;
+        if (ws) {
+                ast_websocket_ref(ws);
+        }
+
+        /* Drain pending results (nonblocking) */
+        if (ws) {
+                char *res = NULL;
+                int res_len;
+
+                while (ast_websocket_wait_for_input(ws, 0) > 0) {
+                        res_len = ast_websocket_read_string(ws, &res);
+                        if (res_len < 0 || !res) {
+                                vosk_speech->recv_errors++;
+                                break;
+                        }
+
+                        struct ast_json_error err;
+                        struct ast_json *j = ast_json_load_string(res, &err);
+                        ast_free(res);
+                        res = NULL;
+
+                        if (!j) {
+                                vosk_speech->json_errors++;
+                                ast_log(LOG_DEBUG, "(%s) JSON parse error: %s\n",
+                                        vosk_speech->name, err.text);
+                                continue;
+                        }
+
+                        const char *partial = ast_json_object_string_get(j, "partial");
+                        const char *text    = ast_json_object_string_get(j, "text");
+
+                        if (partial && !ast_strlen_zero(partial)) {
+                                /* Update last_result to the current partial */
+                                ast_free(vosk_speech->last_result);
+                                vosk_speech->last_result = ast_strdup(partial);
+
+                                /* Dedup partial events */
+                                if (!vosk_speech->last_partial_sent ||
+                                    strcmp(vosk_speech->last_partial_sent, partial) != 0) {
+
+                                        ast_free(vosk_speech->last_partial_sent);
+                                        vosk_speech->last_partial_sent = ast_strdup(partial);
+
+                                        long ms_offset = ast_tvdiff_ms(ast_tvnow(), vosk_speech->start_time);
+
+                                        if (strlen(partial) < 2500) {
+                                                manager_event(EVENT_FLAG_REPORTING, "VoskPartial",
+                                                        "Channel: %s\r\n"
+                                                        "Uniqueid: %s\r\n"
+                                                        "TimeCode: %ld\r\n"
+                                                        "PartialText: %s\r\n",
+                                                        vosk_speech->chan_name[0] ? vosk_speech->chan_name : "not_set_in_dialplan",
+                                                        vosk_speech->chan_uniqueid[0] ? vosk_speech->chan_uniqueid : "not_set_in_dialplan",
+                                                        ms_offset,
+                                                        partial);
+                                        }
+                                }
+                        } else if (text && !ast_strlen_zero(text)) {
+                                /* Final text */
+                                ast_free(vosk_speech->last_result);
+                                vosk_speech->last_result = ast_strdup(text);
+
+                                /* This tells the core “we have something worth reading” */
+                                ast_set_flag(speech, AST_SPEECH_HAVE_RESULTS);
+                        }
+
+                        ast_json_free(j);
+                }
+        }
+
+        if (ws) {
+                ast_websocket_unref(ws);
+        }
+
+        /* Build the speech result */
+        speech_result = ast_calloc(1, sizeof(*speech_result));
+        if (!speech_result) {
+                return NULL;
+        }
+
+        speech_result->text  = ast_strdup(S_OR(vosk_speech->last_result, ""));
         speech_result->score = 100;
 
+        /* You can set HAVE_RESULTS only if non-empty, but harmless as-is */
         ast_set_flag(speech, AST_SPEECH_HAVE_RESULTS);
+
         return speech_result;
 }
 
