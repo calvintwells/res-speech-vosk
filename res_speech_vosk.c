@@ -342,25 +342,39 @@ static int vosk_recog_destroy(struct ast_speech *speech)
 
         ast_debug(1, "(%s) Destroy speech resource\n", vosk_speech->name);
 
+        /* === SAFETY FIX: Acquire lock to synchronize with vosk_recog_write() === */
+        ast_mutex_lock(&speech->lock);
+
         if (vosk_speech->ws) {
                 int fd = ast_websocket_fd(vosk_speech->ws);
 
-                /* Flush tail audio BEFORE EOF */
+                /* Flush any remaining buffered audio before sending EOF */
                 vosk_flush_tail(vosk_speech);
 
                 if (fd > 0) {
+                        /* Gracefully signal end of stream */
                         ast_websocket_write_string(vosk_speech->ws, eof);
                         ast_websocket_close(vosk_speech->ws, 1000);
                         shutdown(fd, SHUT_RDWR);
                 }
+
                 ast_websocket_unref(vosk_speech->ws);
                 vosk_speech->ws = NULL;
         }
 
         ast_free(vosk_speech->last_result);
+        vosk_speech->last_result = NULL;
+
         ast_free(vosk_speech->last_partial_sent);
+        vosk_speech->last_partial_sent = NULL;
+
         ast_free(vosk_speech);
+        vosk_speech = NULL;
+
         speech->data = NULL;
+
+        ast_mutex_unlock(&speech->lock);
+        /* === END SAFETY FIX === */
 
         return 0;
 }
