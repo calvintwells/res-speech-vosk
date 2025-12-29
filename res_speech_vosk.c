@@ -179,7 +179,6 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                 }
         }
 
-        /* Avoid early returns that could break lock symmetry */
         if (!vosk_speech->ws) {
                 rc = -1;
                 goto out_no_unlock;
@@ -190,7 +189,6 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                 goto out_no_unlock;
         }
 
-        /* Reject absurdly large single frames */
         if (len > VOSK_BUF_SIZE) {
                 ast_log(LOG_ERROR, "(%s) Frame too large: %d > %d\n",
                         vosk_speech->name, len, VOSK_BUF_SIZE);
@@ -198,26 +196,24 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                 goto out_no_unlock;
         }
 
-        /* If it won't fit, flush what we have */
+        /* Flush if buffer is too full */
         if (vosk_speech->offset + len > VOSK_BUF_SIZE) {
                 if (vosk_speech->offset > 0) {
-                        if (ast_websocket_write(vosk_speech->ws,
-                                                AST_WEBSOCKET_OPCODE_BINARY,
-                                                vosk_speech->buf,
-                                                vosk_speech->offset) < 0) {
-                                ast_log(LOG_WARNING,
-                                        "(%s) WebSocket write failed (pre-flush)\n",
-                                        vosk_speech->name);
-                        }
+                    if (ast_websocket_write(vosk_speech->ws,
+                                            AST_WEBSOCKET_OPCODE_BINARY,
+                                            vosk_speech->buf,
+                                            vosk_speech->offset) < 0) {
+                        ast_log(LOG_WARNING,
+                                "(%s) WebSocket write failed (pre-flush)\n",
+                                vosk_speech->name);
+                    }
                 }
-                /* Always reset offset after detecting overflow */
                 vosk_speech->offset = 0;
         }
 
         memcpy(vosk_speech->buf + vosk_speech->offset, data, len);
         vosk_speech->offset += len;
 
-        /* Only possible to be exactly full here */
         if (vosk_speech->offset == VOSK_BUF_SIZE) {
                 if (ast_websocket_write(vosk_speech->ws,
                                         AST_WEBSOCKET_OPCODE_BINARY,
@@ -230,34 +226,35 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                 vosk_speech->offset = 0;
         }
 
-        /* === SAFETY FIX START === */
-        /* Take a reference so speech object survives if destroy runs concurrently */
-        ao2_ref(speech, +1);
+        /* === ROBUST DETACHED DRAIN FIX === */
+        /* Detach everything we need BEFORE unlocking */
+        struct ast_websocket *ws = vosk_speech->ws;
+        char *name = vosk_speech->name;
+        struct timeval start_time = vosk_speech->start_time;
+        char chan_name[AST_CHANNEL_NAME];
+        char chan_uniqueid[AST_MAX_UNIQUEID];
+        char *last_partial_sent = vosk_speech->last_partial_sent;
 
-        /* Release lock while performing potentially blocking websocket I/O */
+        ast_copy_string(chan_name, vosk_speech->chan_name, sizeof(chan_name));
+        ast_copy_string(chan_uniqueid, vosk_speech->chan_uniqueid, sizeof(chan_uniqueid));
+
+        /* Release the speech lock — from here on, speech may be destroyed */
         ast_mutex_unlock(&speech->lock);
 
-        /* Drain all pending recognition results */
-        while (ast_websocket_wait_for_input(vosk_speech->ws, 0) > 0) {
-                /* Safety: if SpeechDestroy raced and closed ws, exit early */
-                if (!vosk_speech->ws) {
-                        break;
-                }
-
-                res_len = ast_websocket_read_string(vosk_speech->ws, &res);
+        /* Drain pending results using only detached/local data */
+        while (ws && ast_websocket_wait_for_input(ws, 0) > 0) {
+                res_len = ast_websocket_read_string(ws, &res);
                 if (res_len < 0 || !res) {
                         break;
                 }
 
                 struct ast_json_error err;
                 struct ast_json *j = ast_json_load_string(res, &err);
-                /* Always free the websocket string */
                 ast_free(res);
                 res = NULL;
 
                 if (!j) {
-                        ast_log(LOG_ERROR, "(%s) JSON parse error: %s\n",
-                                vosk_speech->name, err.text);
+                        ast_log(LOG_ERROR, "(%s) JSON parse error: %s\n", name, err.text);
                         continue;
                 }
 
@@ -265,24 +262,24 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                 const char *text = ast_json_object_string_get(j, "text");
 
                 if (partial && !ast_strlen_zero(partial)) {
+                        /* Update last_result safely (it's just a pointer in vosk_speech) */
                         ast_free(vosk_speech->last_result);
                         vosk_speech->last_result = ast_strdup(partial);
 
-                        /* Only emit when partial changes (dedupe) */
-                        if (!vosk_speech->last_partial_sent || strcmp(vosk_speech->last_partial_sent, partial) != 0) {
+                        /* Deduped partial event */
+                        if (!last_partial_sent || strcmp(last_partial_sent, partial) != 0) {
                                 ast_free(vosk_speech->last_partial_sent);
                                 vosk_speech->last_partial_sent = ast_strdup(partial);
 
-                                long ms_offset = ast_tvdiff_ms(ast_tvnow(), vosk_speech->start_time);
-
+                                long ms_offset = ast_tvdiff_ms(ast_tvnow(), start_time);
                                 if (strlen(partial) < 2500) {
                                         manager_event(EVENT_FLAG_REPORTING, "VoskPartial",
                                             "Channel: %s\r\n"
                                             "Uniqueid: %s\r\n"
                                             "TimeCode: %ld\r\n"
                                             "PartialText: %s\r\n",
-                                            vosk_speech->chan_name[0] ? vosk_speech->chan_name : "not_set_in_dialplan",
-                                            vosk_speech->chan_uniqueid[0] ? vosk_speech->chan_uniqueid : "not_set_in_dialplan",
+                                            chan_name[0] ? chan_name : "not_set_in_dialplan",
+                                            chan_uniqueid[0] ? chan_uniqueid : "not_set_in_dialplan",
                                             ms_offset,
                                             partial);
                                 }
@@ -290,18 +287,18 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                 } else if (text && !ast_strlen_zero(text)) {
                         ast_free(vosk_speech->last_result);
                         vosk_speech->last_result = ast_strdup(text);
-                        ast_speech_change_state(speech, AST_SPEECH_STATE_DONE);
+                        /* We cannot safely call ast_speech_change_state(speech, ...) here */
+                        /* The core will detect final result via vosk_recog_get() or timeout */
                 }
 
                 ast_json_free(j);
         }
+        /* === END DETACHED FIX === */
 
-        /* Re-acquire lock */
-        ast_mutex_lock(&speech->lock);
-
-        /* Drop the extra reference taken before unlock */
-        ao2_ref(speech, -1);
-        /* === SAFETY FIX END === */
+        /* Try to re-acquire lock to maintain symmetry — but don't crash if object is gone */
+        if (speech && ast_mutex_lock(&speech->lock) == 0) {
+                ast_mutex_unlock(&speech->lock);
+        }
 
 out_no_unlock:
         if (res) {
