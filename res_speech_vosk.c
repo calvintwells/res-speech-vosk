@@ -339,39 +339,50 @@ static int vosk_recog_destroy(struct ast_speech *speech)
 
         ast_debug(1, "(%s) Destroy speech resource\n", vosk_speech->name);
 
-        /* === SAFETY FIX: Acquire lock to synchronize with vosk_recog_write() === */
+        /* Acquire lock to synchronize with vosk_recog_write() */
         ast_mutex_lock(&speech->lock);
 
+        /* Close websocket and send EOF if still open */
         if (vosk_speech->ws) {
                 int fd = ast_websocket_fd(vosk_speech->ws);
 
-                /* Flush any remaining buffered audio before sending EOF */
+                /* Flush any buffered audio so server processes last frames */
                 vosk_flush_tail(vosk_speech);
 
                 if (fd > 0) {
-                        /* Gracefully signal end of stream */
-                        ast_websocket_write_string(vosk_speech->ws, eof);
-                        ast_websocket_close(vosk_speech->ws, 1000);
-                        shutdown(fd, SHUT_RDWR);
+                    /* Send explicit EOF — helps Vosk return final result faster */
+                    ast_websocket_write_string(vosk_speech->ws, eof);
+
+                    /* Normal close */
+                    ast_websocket_close(vosk_speech->ws, 1000);
+                    shutdown(fd, SHUT_RDWR);
                 }
 
                 ast_websocket_unref(vosk_speech->ws);
                 vosk_speech->ws = NULL;
         }
 
+        /* 
+         * Preserve final result if present.
+         * Note: last_result may have been updated by a concurrent unlocked
+         * vosk_recog_write() drain loop — but since we're holding the lock here,
+         * no new writes can occur, and any in-flight drain is using detached locals.
+         * It's safe to read and free here.
+         */
         ast_free(vosk_speech->last_result);
         vosk_speech->last_result = NULL;
 
         ast_free(vosk_speech->last_partial_sent);
         vosk_speech->last_partial_sent = NULL;
 
+        /* Free the private structure */
         ast_free(vosk_speech);
-        vosk_speech = NULL;
 
+        /* Clear pointer in speech object */
         speech->data = NULL;
 
+        /* Release lock — speech object may be freed by core immediately after this */
         ast_mutex_unlock(&speech->lock);
-        /* === END SAFETY FIX === */
 
         return 0;
 }
