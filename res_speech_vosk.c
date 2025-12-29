@@ -185,7 +185,6 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                 goto out_no_unlock;
         }
 
-
         if (len <= 0) {
                 rc = 0;
                 goto out_no_unlock;
@@ -209,8 +208,8 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                                 ast_log(LOG_WARNING,
                                         "(%s) WebSocket write failed (pre-flush)\n",
                                         vosk_speech->name);
-                        }                        
-                } 
+                        }
+                }
                 /* Always reset offset after detecting overflow */
                 vosk_speech->offset = 0;
         }
@@ -231,11 +230,20 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                 vosk_speech->offset = 0;
         }
 
-        /* Release lock while performing websocket I/O */
+        /* === SAFETY FIX START === */
+        /* Take a reference so speech object survives if destroy runs concurrently */
+        ao2_ref(speech, +1);
+
+        /* Release lock while performing potentially blocking websocket I/O */
         ast_mutex_unlock(&speech->lock);
 
         /* Drain all pending recognition results */
         while (ast_websocket_wait_for_input(vosk_speech->ws, 0) > 0) {
+                /* Safety: if SpeechDestroy raced and closed ws, exit early */
+                if (!vosk_speech->ws) {
+                        break;
+                }
+
                 res_len = ast_websocket_read_string(vosk_speech->ws, &res);
                 if (res_len < 0 || !res) {
                         break;
@@ -243,7 +251,6 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
 
                 struct ast_json_error err;
                 struct ast_json *j = ast_json_load_string(res, &err);
-
                 /* Always free the websocket string */
                 ast_free(res);
                 res = NULL;
@@ -255,7 +262,7 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                 }
 
                 const char *partial = ast_json_object_string_get(j, "partial");
-                const char *text    = ast_json_object_string_get(j, "text");
+                const char *text = ast_json_object_string_get(j, "text");
 
                 if (partial && !ast_strlen_zero(partial)) {
                         ast_free(vosk_speech->last_result);
@@ -263,20 +270,11 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
 
                         /* Only emit when partial changes (dedupe) */
                         if (!vosk_speech->last_partial_sent || strcmp(vosk_speech->last_partial_sent, partial) != 0) {
-                                
                                 ast_free(vosk_speech->last_partial_sent);
                                 vosk_speech->last_partial_sent = ast_strdup(partial);
-                                
-                                /* Calculate how many MS have passed since we started listening */
+
                                 long ms_offset = ast_tvdiff_ms(ast_tvnow(), vosk_speech->start_time);
-        
-                                /* NOTE: Channel metadata will only be captured if the dialplan sets:
-                                 *   same => n,Set(SPEECH_ENGINE(channel)=${CHANNEL})
-                                 *   same => n,Set(SPEECH_ENGINE(uniqueid)=${UNIQUEID})
-                                 * after calling SpeechCreate(vosk).
-                                 * Otherwise, diagnostic placeholders will appear in AMI events.
-                                 */
-                                
+
                                 if (strlen(partial) < 2500) {
                                         manager_event(EVENT_FLAG_REPORTING, "VoskPartial",
                                             "Channel: %s\r\n"
@@ -289,7 +287,6 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                                             partial);
                                 }
                         }
-
                 } else if (text && !ast_strlen_zero(text)) {
                         ast_free(vosk_speech->last_result);
                         vosk_speech->last_result = ast_strdup(text);
@@ -299,8 +296,12 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                 ast_json_free(j);
         }
 
-        /* Re-acquire lock before returning */
+        /* Re-acquire lock */
         ast_mutex_lock(&speech->lock);
+
+        /* Drop the extra reference taken before unlock */
+        ao2_ref(speech, -1);
+        /* === SAFETY FIX END === */
 
 out_no_unlock:
         if (res) {
