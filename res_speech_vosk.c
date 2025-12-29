@@ -280,9 +280,6 @@ static int vosk_recog_destroy(struct ast_speech *speech)
         vosk_speech->ws = NULL;
         vosk_speech->state = VOSK_STATE_CLOSED;
 
-        /* Flush any buffered audio so server processes last frames */
-        vosk_flush_tail(vosk_speech);
-
         /* Close websocket and send EOF if still open */
         if (ws) {
                 int fd = ast_websocket_fd(ws);
