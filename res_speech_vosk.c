@@ -347,8 +347,11 @@ static int vosk_try_connect(vosk_speech_t *vosk_speech)
         return 0;
     }
 
-    /* Clear any stale pointer */
-    vosk_speech->ws = NULL;
+    /* If there is a stale websocket, unref it instead of leaking it */
+    if (vosk_speech->ws) {
+        ast_websocket_unref(vosk_speech->ws);
+        vosk_speech->ws = NULL;
+    }
 
     while (attempts < 3) {
         vosk_speech->ws = ast_websocket_client_create(
