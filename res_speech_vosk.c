@@ -379,12 +379,27 @@ static int vosk_recog_deactivate_grammar(struct ast_speech *speech, const char *
 }
 
 /** \brief Signal DTMF was received */
+/** \brief Signal DTMF was received */
 static int vosk_recog_dtmf(struct ast_speech *speech, const char *dtmf)
 {
-        vosk_speech_t *vosk_speech = speech->data;
-        ast_verb(4, "(%s) Signal DTMF %s\n", vosk_speech->name, dtmf);
+        vosk_speech_t *vosk_speech;
+        const char *name = "vosk";
+
+        if (!speech) {
+                return 0;
+        }
+
+        ast_mutex_lock(&speech->lock);
+        vosk_speech = speech->data;
+        if (vosk_speech && !vosk_speech->destroying && vosk_speech->name) {
+                name = vosk_speech->name;
+        }
+        ast_mutex_unlock(&speech->lock);
+
+        ast_verb(4, "(%s) Signal DTMF %s\n", name, dtmf ? dtmf : "");
         return 0;
 }
+
 
 /* Attempt to establish websocket connection if engine is FAILED or INIT.
  * Caller MUST hold speech->lock.
@@ -517,10 +532,24 @@ static int vosk_recog_change(struct ast_speech *speech, const char *name, const 
 /** \brief Get an engine specific attribute */
 static int vosk_recog_get_settings(struct ast_speech *speech, const char *name, char *buf, size_t len)
 {
-        vosk_speech_t *vosk_speech = speech->data;
-        ast_debug(1, "(%s) Get settings name: %s\n", vosk_speech->name, name);
+        vosk_speech_t *vosk_speech;
+        const char *logname = "vosk";
+
+        if (!speech) {
+                return -1;
+        }
+
+        ast_mutex_lock(&speech->lock);
+        vosk_speech = speech->data;
+        if (vosk_speech && !vosk_speech->destroying && vosk_speech->name) {
+                logname = vosk_speech->name;
+        }
+        ast_mutex_unlock(&speech->lock);
+
+        ast_debug(1, "(%s) Get settings name: %s\n", logname, name ? name : "");
         return -1;
 }
+
 
 /** \brief Change the type of results we want back */
 static int vosk_recog_change_results_type(struct ast_speech *speech, enum ast_speech_results_type results_type)
@@ -541,7 +570,7 @@ struct ast_speech_result *vosk_recog_get(struct ast_speech *speech)
         }
 
         /*
-         * Phase 1: snapshot ws under lock
+         * Phase 1: snapshot ws under lock (with lazy-connect if needed)
          */
         ast_mutex_lock(&speech->lock);
 
@@ -551,6 +580,14 @@ struct ast_speech_result *vosk_recog_get(struct ast_speech *speech)
                 return NULL;
         }
 
+        /* If not connected, try lazy-connect while holding the lock
+         * (vosk_try_connect assumes caller holds speech->lock).
+         */
+        if (vosk_speech->state != VOSK_STATE_CONNECTED || !vosk_speech->ws) {
+                (void)vosk_try_connect(vosk_speech);
+        }
+
+        /* Snapshot ws after possible reconnect */
         if (vosk_speech->state == VOSK_STATE_CONNECTED && vosk_speech->ws) {
                 ws = vosk_speech->ws;
                 ast_websocket_ref(ws);
@@ -675,8 +712,8 @@ struct ast_speech_result *vosk_recog_get(struct ast_speech *speech)
         ast_mutex_unlock(&speech->lock);
 
         if (!final_text) {
-                ast_free(speech_result);
-                return NULL;
+            ast_free(speech_result);
+            return NULL;
         }
 
         speech_result->text = final_text;
@@ -687,6 +724,7 @@ struct ast_speech_result *vosk_recog_get(struct ast_speech *speech)
 
         return speech_result;
 }
+
 
 
 
