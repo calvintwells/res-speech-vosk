@@ -161,44 +161,54 @@ static void vosk_flush_tail(vosk_speech_t *vosk_speech)
 /** \brief Write audio to the speech engine (AUDIO ONLY — no websocket read/drain here) */
 static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
 {
-        vosk_speech_t *vosk_speech = speech ? speech->data : NULL;
+        vosk_speech_t *vosk_speech = NULL;
+        struct ast_websocket *ws = NULL;
+        int rc = 0;
 
+        if (!speech || !data || len <= 0) {
+                return 0;
+        }
+
+        /* Lock while touching speech->data / vosk_speech fields to avoid UAF with destroy() */
+        ast_mutex_lock(&speech->lock);
+
+        vosk_speech = speech->data;
         if (!vosk_speech) {
-                return -1;
+                rc = -1;
+                goto out_unlock;
         }
 
         /* If websocket is not connected, try lazy-connect; if still down, ignore audio */
         if (vosk_speech->state != VOSK_STATE_CONNECTED || !vosk_speech->ws) {
                 if (vosk_try_connect(vosk_speech) < 0) {
-                        return 0; /* silently ignore until server comes up */
+                        rc = 0; /* silently ignore until server comes up */
+                        goto out_unlock;
                 }
         }
 
-        if (!vosk_speech->ws) {
-                return -1;
-        }
-
-        if (len <= 0) {
-                return 0;
+        ws = vosk_speech->ws;
+        if (!ws) {
+                rc = -1;
+                goto out_unlock;
         }
 
         if (len > VOSK_BUF_SIZE) {
                 ast_log(LOG_ERROR, "(%s) Frame too large: %d > %d\n",
                         vosk_speech->name, len, VOSK_BUF_SIZE);
-                return -1;
+                rc = -1;
+                goto out_unlock;
         }
 
         /* If incoming chunk would overflow buffer, flush current buffer first */
         if (vosk_speech->offset + len > VOSK_BUF_SIZE) {
                 if (vosk_speech->offset > 0) {
-                        if (ast_websocket_write(vosk_speech->ws,
+                        if (ast_websocket_write(ws,
                                                 AST_WEBSOCKET_OPCODE_BINARY,
                                                 vosk_speech->buf,
                                                 vosk_speech->offset) < 0) {
                                 vosk_speech->send_errors++;
                                 ast_log(LOG_WARNING, "(%s) WebSocket write failed (pre-flush)\n",
                                         vosk_speech->name);
-                                /* keep going; we'll drop/continue rather than crash */
                         }
                 }
                 vosk_speech->offset = 0;
@@ -209,7 +219,7 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
 
         /* Flush full buffer */
         if (vosk_speech->offset == VOSK_BUF_SIZE) {
-                if (ast_websocket_write(vosk_speech->ws,
+                if (ast_websocket_write(ws,
                                         AST_WEBSOCKET_OPCODE_BINARY,
                                         vosk_speech->buf,
                                         VOSK_BUF_SIZE) < 0) {
@@ -220,8 +230,11 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                 vosk_speech->offset = 0;
         }
 
-        return 0;
+out_unlock:
+        ast_mutex_unlock(&speech->lock);
+        return rc;
 }
+
 
 
 /*! \brief Stop the in-progress recognition */
