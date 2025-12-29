@@ -259,7 +259,10 @@ static int vosk_recog_destroy(struct ast_speech *speech)
         /* Acquire lock to synchronize with vosk_recog_get()/write() */
         ast_mutex_lock(&speech->lock);
 
-        /* Detach ws first so concurrent readers see NULL immediately */
+        /* Flush first while vosk_speech->ws is still valid */
+        vosk_flush_tail(vosk_speech);
+        
+       /* Now detach ws so concurrent readers see NULL immediately */
         struct ast_websocket *ws = vosk_speech->ws;
         vosk_speech->ws = NULL;
         vosk_speech->state = VOSK_STATE_CLOSED;
