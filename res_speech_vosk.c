@@ -256,36 +256,35 @@ static int vosk_recog_destroy(struct ast_speech *speech)
 
         ast_debug(1, "(%s) Destroy speech resource\n", vosk_speech->name);
 
-        /* Acquire lock to synchronize with vosk_recog_write() */
+        /* Acquire lock to synchronize with vosk_recog_get()/write() */
         ast_mutex_lock(&speech->lock);
 
-        /* Close websocket and send EOF if still open */
-        if (vosk_speech->ws) {
-                int fd = ast_websocket_fd(vosk_speech->ws);
+        /* Detach ws first so concurrent readers see NULL immediately */
+        struct ast_websocket *ws = vosk_speech->ws;
+        vosk_speech->ws = NULL;
+        vosk_speech->state = VOSK_STATE_CLOSED;
 
-                /* Flush any buffered audio so server processes last frames */
-                vosk_flush_tail(vosk_speech);
+        /* Flush any buffered audio so server processes last frames */
+        vosk_flush_tail(vosk_speech);
+
+        /* Close websocket and send EOF if still open */
+        if (ws) {
+                int fd = ast_websocket_fd(ws);
 
                 if (fd > 0) {
-                    /* Send explicit EOF — helps Vosk return final result faster */
-                    ast_websocket_write_string(vosk_speech->ws, eof);
+                        /* Send explicit EOF — helps Vosk return final result faster */
+                        ast_websocket_write_string(ws, eof);
 
-                    /* Normal close */
-                    ast_websocket_close(vosk_speech->ws, 1000);
-                    shutdown(fd, SHUT_RDWR);
+                        /* Normal close */
+                        ast_websocket_close(ws, 1000);
+                        shutdown(fd, SHUT_RDWR);
                 }
 
-                ast_websocket_unref(vosk_speech->ws);
-                vosk_speech->ws = NULL;
+                ast_websocket_unref(ws);
+                ws = NULL;
         }
 
-        /* 
-         * Preserve final result if present.
-         * Note: last_result may have been updated by a concurrent unlocked
-         * vosk_recog_write() drain loop — but since we're holding the lock here,
-         * no new writes can occur, and any in-flight drain is using detached locals.
-         * It's safe to read and free here.
-         */
+        /* Free stored strings */
         ast_free(vosk_speech->last_result);
         vosk_speech->last_result = NULL;
 
@@ -294,15 +293,12 @@ static int vosk_recog_destroy(struct ast_speech *speech)
 
         /* Free the private structure */
         ast_free(vosk_speech);
-
-        /* Clear pointer in speech object */
         speech->data = NULL;
 
-        /* Release lock — speech object may be freed by core immediately after this */
         ast_mutex_unlock(&speech->lock);
-
         return 0;
 }
+
 
 /*! \brief Load a local grammar on the speech structure */
 static int vosk_recog_load_grammar(struct ast_speech *speech, const char *grammar_name, const char *grammar_path)
