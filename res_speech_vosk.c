@@ -41,6 +41,8 @@
 
 #include <asterisk/http_websocket.h>
 
+#include <string.h>
+
 #define VOSK_ENGINE_NAME "vosk"
 #define VOSK_ENGINE_CONFIG "res_speech_vosk.conf"
 #define VOSK_BUF_SIZE 3200
@@ -65,6 +67,9 @@ struct vosk_speech_t {
 
         /* Websocket connection (protected by lock) */
         struct ast_websocket    *ws;
+
+        /* Serialize ALL websocket I/O (write/read/close) */
+        ast_mutex_t              ws_io_lock;
 
         /* Protects all fields below */
         ast_mutex_t              lock;
@@ -129,11 +134,37 @@ static void vosk_leave(vosk_speech_t *vs)
         ast_mutex_unlock(&vs->lock);
 }
 
+/*
+ * Critical: speech* lifetime vs vs* lifetime.
+ * We must never assume speech is valid after hangup/teardown.
+ * Acquire vs under speech->lock, and "enter" while the pointer is stable.
+ */
+static vosk_speech_t *vosk_get_and_enter(struct ast_speech *speech)
+{
+        vosk_speech_t *vs = NULL;
+
+        if (!speech) {
+                return NULL;
+        }
+
+        ast_mutex_lock(&speech->lock);
+        vs = speech->data;
+        if (vs) {
+                if (!vosk_enter(vs)) {
+                        vs = NULL;
+                }
+        }
+        ast_mutex_unlock(&speech->lock);
+
+        return vs;
+}
+
 /* Helper: flush any remaining buffered audio (safe vs destroy/stop) */
 static void vosk_flush_tail(vosk_speech_t *vosk_speech)
 {
         struct ast_websocket *ws = NULL;
         int bytes = 0;
+        char tail_copy[VOSK_BUF_SIZE];
 
         if (!vosk_speech) {
                 return;
@@ -144,6 +175,10 @@ static void vosk_flush_tail(vosk_speech_t *vosk_speech)
                 ws = vosk_speech->ws;
                 ast_websocket_ref(ws);
                 bytes = vosk_speech->offset;
+
+                /* Local copy while locked (prevents concurrent write corruption) */
+                memcpy(tail_copy, vosk_speech->buf, bytes);
+
                 vosk_speech->offset = 0;
         }
         ast_mutex_unlock(&vosk_speech->lock);
@@ -155,9 +190,11 @@ static void vosk_flush_tail(vosk_speech_t *vosk_speech)
         ast_debug(3, "(%s) Flushing tail audio: %d bytes\n",
                   vosk_speech->name, bytes);
 
+        /* Serialize WebSocket I/O */
+        ast_mutex_lock(&vosk_speech->ws_io_lock);
         if (ast_websocket_write(ws,
                                 AST_WEBSOCKET_OPCODE_BINARY,
-                                vosk_speech->buf,
+                                tail_copy,
                                 bytes) < 0) {
                 ast_log(LOG_WARNING, "(%s) WebSocket write failed (tail flush)\n",
                         vosk_speech->name);
@@ -165,6 +202,7 @@ static void vosk_flush_tail(vosk_speech_t *vosk_speech)
                 vosk_speech->send_errors++;
                 ast_mutex_unlock(&vosk_speech->lock);
         }
+        ast_mutex_unlock(&vosk_speech->ws_io_lock);
 
         ast_websocket_unref(ws);
 }
@@ -181,8 +219,13 @@ static int vosk_recog_create(struct ast_speech *speech, struct ast_format *forma
         }
 
         vosk_speech->name = "vosk";
-        speech->data = vosk_speech;
 
+        /* Publish speech->data under speech lock (consistent with destroy) */
+        ast_mutex_lock(&speech->lock);
+        speech->data = vosk_speech;
+        ast_mutex_unlock(&speech->lock);
+
+        ast_mutex_init(&vosk_speech->ws_io_lock);
         ast_mutex_init(&vosk_speech->lock);
         ast_cond_init(&vosk_speech->cond, NULL);
 
@@ -202,8 +245,15 @@ static int vosk_recog_create(struct ast_speech *speech, struct ast_format *forma
         if (!vosk_speech->ws) {
                 ast_cond_destroy(&vosk_speech->cond);
                 ast_mutex_destroy(&vosk_speech->lock);
-                ast_free(speech->data);
-                speech->data = NULL;
+                ast_mutex_destroy(&vosk_speech->ws_io_lock);
+
+                ast_mutex_lock(&speech->lock);
+                if (speech->data == vosk_speech) {
+                        speech->data = NULL;
+                }
+                ast_mutex_unlock(&speech->lock);
+
+                ast_free(vosk_speech);
                 return -1;
         }
 
@@ -214,16 +264,17 @@ static int vosk_recog_create(struct ast_speech *speech, struct ast_format *forma
 /** \brief Write audio to the speech engine */
 static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
 {
-        vosk_speech_t *vosk_speech = speech ? speech->data : NULL;
+        vosk_speech_t *vosk_speech = vosk_get_and_enter(speech);
         struct ast_websocket *ws = NULL;
         char *res = NULL;
         int res_len;
 
-        if (!vosk_speech) {
-                return -1;
-        }
+        int flush_bytes = 0;
+        int full_chunk = 0;
+        char flush_copy[VOSK_BUF_SIZE];
+        char full_copy[VOSK_BUF_SIZE];
 
-        if (!vosk_enter(vosk_speech)) {
+        if (!vosk_speech) {
                 return -1;
         }
 
@@ -239,10 +290,13 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                 return -1;
         }
 
-        /* Touch shared state under lock, but do NOT do websocket I/O while locked */
-        int flush_bytes = 0;
-        int full_chunk = 0;
-
+        /*
+         * We do NOT do websocket I/O while holding vosk_speech->lock,
+         * but we DO:
+         *  - take a ref to ws under lock
+         *  - take local copies of any chunks we plan to send
+         * Then we serialize actual websocket I/O with ws_io_lock.
+         */
         ast_mutex_lock(&vosk_speech->lock);
 
         if (!vosk_speech->ws || vosk_speech->closing) {
@@ -254,22 +308,37 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
         ws = vosk_speech->ws;
         ast_websocket_ref(ws);
 
+        /* If appending would overflow existing partial buffer, pre-flush what we have */
         if (vosk_speech->offset + len > VOSK_BUF_SIZE && vosk_speech->offset > 0) {
                 flush_bytes = vosk_speech->offset;
+
+                /* Local copy of pre-flush bytes while locked */
+                memcpy(flush_copy, vosk_speech->buf, flush_bytes);
+
                 vosk_speech->offset = 0;
                 vosk_speech->overflow_events++;
         }
 
+        /* Append current audio frame */
         memcpy(vosk_speech->buf + vosk_speech->offset, data, len);
         vosk_speech->offset += len;
-        full_chunk = (vosk_speech->offset == VOSK_BUF_SIZE);
+
+        /* If we filled a full chunk, copy it out and reset offset while locked */
+        if (vosk_speech->offset == VOSK_BUF_SIZE) {
+                full_chunk = 1;
+                memcpy(full_copy, vosk_speech->buf, VOSK_BUF_SIZE);
+                vosk_speech->offset = 0;
+        }
 
         ast_mutex_unlock(&vosk_speech->lock);
+
+        /* Serialize ALL websocket I/O (writes + drain) */
+        ast_mutex_lock(&vosk_speech->ws_io_lock);
 
         /* Write any pre-flush chunk */
         if (flush_bytes > 0) {
                 if (ast_websocket_write(ws, AST_WEBSOCKET_OPCODE_BINARY,
-                                        vosk_speech->buf, flush_bytes) < 0) {
+                                        flush_copy, flush_bytes) < 0) {
                         ast_log(LOG_WARNING, "(%s) WebSocket write failed (pre-flush)\n", vosk_speech->name);
                         ast_mutex_lock(&vosk_speech->lock);
                         vosk_speech->send_errors++;
@@ -280,27 +349,29 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
         /* Write full chunk */
         if (full_chunk) {
                 if (ast_websocket_write(ws, AST_WEBSOCKET_OPCODE_BINARY,
-                                        vosk_speech->buf, VOSK_BUF_SIZE) < 0) {
+                                        full_copy, VOSK_BUF_SIZE) < 0) {
                         ast_log(LOG_WARNING, "(%s) WebSocket write failed (full chunk)\n", vosk_speech->name);
                         ast_mutex_lock(&vosk_speech->lock);
                         vosk_speech->send_errors++;
                         ast_mutex_unlock(&vosk_speech->lock);
                 }
-
-                ast_mutex_lock(&vosk_speech->lock);
-                vosk_speech->offset = 0;
-                ast_mutex_unlock(&vosk_speech->lock);
         }
 
         /* Drain pending recognition results (non-blocking) */
-        while (ast_websocket_wait_for_input(ws, 0) > 0) {
+        for (;;) {
+                int w = ast_websocket_wait_for_input(ws, 0);
+                if (w <= 0) {
+                        break;
+                }
 
                 /* If destroy started, stop draining immediately */
                 ast_mutex_lock(&vosk_speech->lock);
-                int closing = vosk_speech->closing;
-                ast_mutex_unlock(&vosk_speech->lock);
-                if (closing) {
-                        break;
+                {
+                        int closing = vosk_speech->closing;
+                        ast_mutex_unlock(&vosk_speech->lock);
+                        if (closing) {
+                                break;
+                        }
                 }
 
                 res_len = ast_websocket_read_string(ws, &res);
@@ -329,7 +400,15 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                 const char *text    = ast_json_object_string_get(j, "text");
 
                 if (partial && !ast_strlen_zero(partial)) {
-                        long ms_offset = ast_tvdiff_ms(ast_tvnow(), vosk_speech->start_time);
+                        long ms_offset;
+                        struct timeval start;
+
+                        /* Copy start_time under lock to avoid data race */
+                        ast_mutex_lock(&vosk_speech->lock);
+                        start = vosk_speech->start_time;
+                        ast_mutex_unlock(&vosk_speech->lock);
+
+                        ms_offset = ast_tvdiff_ms(ast_tvnow(), start);
 
                         /* Update last_result and dedupe state under lock */
                         char chan_name[AST_CHANNEL_NAME];
@@ -375,16 +454,31 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
                                 ast_free(vosk_speech->last_result);
                                 vosk_speech->last_result = ast_strdup(text);
                         }
-                        int allow_state_change = !vosk_speech->closing;
-                        ast_mutex_unlock(&vosk_speech->lock);
+                        {
+                                int allow_state_change = !vosk_speech->closing;
+                                ast_mutex_unlock(&vosk_speech->lock);
 
-                        if (allow_state_change) {
-                                ast_speech_change_state(speech, AST_SPEECH_STATE_DONE);
+                                if (allow_state_change) {
+                                        /*
+                                         * CRITICAL: only call into core if speech still points to us.
+                                         * Destroy detaches speech->data early on hangup.
+                                         */
+                                        ast_mutex_lock(&speech->lock);
+                                        if (speech->data == vosk_speech) {
+                                                ast_speech_change_state(speech, AST_SPEECH_STATE_DONE);
+                                        }
+                                        ast_mutex_unlock(&speech->lock);
+                                }
                         }
+
+                        ast_json_free(j);
+                        continue;
                 }
 
                 ast_json_free(j);
         }
+
+        ast_mutex_unlock(&vosk_speech->ws_io_lock);
 
         if (res) {
                 ast_free(res);
@@ -398,14 +492,10 @@ static int vosk_recog_write(struct ast_speech *speech, void *data, int len)
 /*! \brief Stop the in-progress recognition */
 static int vosk_recog_stop(struct ast_speech *speech)
 {
-        vosk_speech_t *vosk_speech = speech ? speech->data : NULL;
+        vosk_speech_t *vosk_speech = vosk_get_and_enter(speech);
         struct ast_websocket *ws = NULL;
 
         if (!vosk_speech) {
-                return 0;
-        }
-
-        if (!vosk_enter(vosk_speech)) {
                 return 0;
         }
 
@@ -417,13 +507,24 @@ static int vosk_recog_stop(struct ast_speech *speech)
         ast_mutex_unlock(&vosk_speech->lock);
 
         if (ws) {
+                /* flush uses ws_io_lock internally */
                 vosk_flush_tail(vosk_speech);
-                ast_websocket_write_string(ws, "{\"eof\":1}");
+
+                ast_mutex_lock(&vosk_speech->ws_io_lock);
+                (void)ast_websocket_write_string(ws, "{\"eof\":1}");
+                ast_mutex_unlock(&vosk_speech->ws_io_lock);
+
                 ast_websocket_unref(ws);
         }
 
         ast_debug(1, "(%s) Stop recognition\n", vosk_speech->name);
-        ast_speech_change_state(speech, AST_SPEECH_STATE_NOT_READY);
+
+        /* Only change state if speech still points to us */
+        ast_mutex_lock(&speech->lock);
+        if (speech->data == vosk_speech) {
+                ast_speech_change_state(speech, AST_SPEECH_STATE_NOT_READY);
+        }
+        ast_mutex_unlock(&speech->lock);
 
         vosk_leave(vosk_speech);
         return 0;
@@ -433,8 +534,21 @@ static int vosk_recog_stop(struct ast_speech *speech)
 static int vosk_recog_destroy(struct ast_speech *speech)
 {
         const char *eof = "{\"eof\": 1}";
-        vosk_speech_t *vs = speech ? speech->data : NULL;
+        vosk_speech_t *vs = NULL;
         struct ast_websocket *ws = NULL;
+
+        if (!speech) {
+                return 0;
+        }
+
+        /*
+         * Detach immediately so any late write/get/stop calls bail
+         * without touching core state via a stale speech*.
+         */
+        ast_mutex_lock(&speech->lock);
+        vs = speech->data;
+        speech->data = NULL;
+        ast_mutex_unlock(&speech->lock);
 
         if (!vs) {
                 return 0;
@@ -443,7 +557,7 @@ static int vosk_recog_destroy(struct ast_speech *speech)
         ast_debug(1, "(%s) Destroy speech resource\n", vs->name);
 
         /*
-         * FIX: detach + close websocket FIRST to break any in-flight blocking I/O,
+         * Detach + close websocket FIRST to break any in-flight I/O,
          * then wait for active_calls to drain. Never shutdown(fd) yourself.
          */
         ast_mutex_lock(&vs->lock);
@@ -458,14 +572,17 @@ static int vosk_recog_destroy(struct ast_speech *speech)
         ast_mutex_unlock(&vs->lock);
 
         if (ws) {
-                /* Best-effort EOF and close to force writers/readers to unwind */
-                ast_websocket_write_string(ws, eof);
-                ast_websocket_close(ws, 1000);
+                /* Serialize EOF/close with any in-flight write/drain */
+                ast_mutex_lock(&vs->ws_io_lock);
+                (void) ast_websocket_write_string(ws, eof);
+                (void) ast_websocket_close(ws, 1000);
+                ast_mutex_unlock(&vs->ws_io_lock);
+
                 ast_websocket_unref(ws);
                 ws = NULL;
         }
 
-        /* Now wait for all in-flight calls to exit */
+        /* Wait for all in-flight calls to exit */
         ast_mutex_lock(&vs->lock);
         while (vs->active_calls > 0) {
                 ast_cond_wait(&vs->cond, &vs->lock);
@@ -481,9 +598,9 @@ static int vosk_recog_destroy(struct ast_speech *speech)
 
         ast_cond_destroy(&vs->cond);
         ast_mutex_destroy(&vs->lock);
+        ast_mutex_destroy(&vs->ws_io_lock);
 
         ast_free(vs);
-        speech->data = NULL;
 
         return 0;
 }
@@ -515,7 +632,20 @@ static int vosk_recog_deactivate_grammar(struct ast_speech *speech, const char *
 /** \brief Signal DTMF was received */
 static int vosk_recog_dtmf(struct ast_speech *speech, const char *dtmf)
 {
-        vosk_speech_t *vosk_speech = speech->data;
+        vosk_speech_t *vosk_speech = NULL;
+
+        if (!speech) {
+                return 0;
+        }
+
+        ast_mutex_lock(&speech->lock);
+        vosk_speech = speech->data;
+        ast_mutex_unlock(&speech->lock);
+
+        if (!vosk_speech) {
+                return 0;
+        }
+
         ast_verb(4, "(%s) Signal DTMF %s\n", vosk_speech->name, dtmf);
         return 0;
 }
@@ -523,10 +653,24 @@ static int vosk_recog_dtmf(struct ast_speech *speech, const char *dtmf)
 /** brief Prepare engine to accept audio */
 static int vosk_recog_start(struct ast_speech *speech)
 {
-        vosk_speech_t *vosk_speech = speech->data;
+        vosk_speech_t *vosk_speech = NULL;
+
+        if (!speech) {
+                return -1;
+        }
+
+        ast_mutex_lock(&speech->lock);
+        vosk_speech = speech->data;
+        ast_mutex_unlock(&speech->lock);
+
+        if (!vosk_speech) {
+                return -1;
+        }
 
         /* Mark the 'Zero' point for timecodes */
+        ast_mutex_lock(&vosk_speech->lock);
         vosk_speech->start_time = ast_tvnow();
+        ast_mutex_unlock(&vosk_speech->lock);
 
         ast_debug(1, "(%s) Start recognition\n", vosk_speech->name);
         ast_speech_change_state(speech, AST_SPEECH_STATE_READY);
@@ -536,13 +680,9 @@ static int vosk_recog_start(struct ast_speech *speech)
 /** \brief Change an engine specific setting */
 static int vosk_recog_change(struct ast_speech *speech, const char *name, const char *value)
 {
-        vosk_speech_t *vosk_speech = speech ? speech->data : NULL;
+        vosk_speech_t *vosk_speech = vosk_get_and_enter(speech);
 
         if (!vosk_speech || ast_strlen_zero(name)) {
-                return -1;
-        }
-
-        if (!vosk_enter(vosk_speech)) {
                 return -1;
         }
 
@@ -574,7 +714,20 @@ static int vosk_recog_change(struct ast_speech *speech, const char *name, const 
 /** \brief Get an engine specific attribute */
 static int vosk_recog_get_settings(struct ast_speech *speech, const char *name, char *buf, size_t len)
 {
-        vosk_speech_t *vosk_speech = speech->data;
+        vosk_speech_t *vosk_speech = NULL;
+
+        if (!speech) {
+            return -1;
+        }
+
+        ast_mutex_lock(&speech->lock);
+        vosk_speech = speech->data;
+        ast_mutex_unlock(&speech->lock);
+
+        if (!vosk_speech) {
+            return -1;
+        }
+
         ast_debug(1, "(%s) Get settings name: %s\n", vosk_speech->name, name);
         return -1;
 }
@@ -589,13 +742,9 @@ static int vosk_recog_change_results_type(struct ast_speech *speech, enum ast_sp
 struct ast_speech_result *vosk_recog_get(struct ast_speech *speech)
 {
         struct ast_speech_result *speech_result;
-        vosk_speech_t *vosk_speech = speech ? speech->data : NULL;
+        vosk_speech_t *vosk_speech = vosk_get_and_enter(speech);
 
         if (!vosk_speech) {
-                return NULL;
-        }
-
-        if (!vosk_enter(vosk_speech)) {
                 return NULL;
         }
 
@@ -611,7 +760,12 @@ struct ast_speech_result *vosk_recog_get(struct ast_speech *speech)
 
         speech_result->score = 100;
 
-        ast_set_flag(speech, AST_SPEECH_HAVE_RESULTS);
+        /* Only set flags if speech still points to us */
+        ast_mutex_lock(&speech->lock);
+        if (speech->data == vosk_speech) {
+                ast_set_flag(speech, AST_SPEECH_HAVE_RESULTS);
+        }
+        ast_mutex_unlock(&speech->lock);
 
         vosk_leave(vosk_speech);
         return speech_result;
@@ -687,8 +841,8 @@ static int load_module(void)
         ast_format_cap_append(ast_engine.formats, ast_format_slin, 0);
 
         if (ast_speech_register(&ast_engine)) {
-            ast_log(LOG_ERROR, "Failed to register module\n");
-            return AST_MODULE_LOAD_FAILURE;
+                ast_log(LOG_ERROR, "Failed to register module\n");
+                return AST_MODULE_LOAD_FAILURE;
         }
 
         return AST_MODULE_LOAD_SUCCESS;
