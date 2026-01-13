@@ -541,13 +541,9 @@ static int vosk_recog_destroy(struct ast_speech *speech)
                 return 0;
         }
 
-        /*
-         * Detach immediately so any late write/get/stop calls bail
-         * without touching core state via a stale speech*.
-         */
+        /* 1. Retrieve the pointer but DO NOT set speech->data = NULL yet */
         ast_mutex_lock(&speech->lock);
         vs = speech->data;
-        speech->data = NULL;
         ast_mutex_unlock(&speech->lock);
 
         if (!vs) {
@@ -556,16 +552,11 @@ static int vosk_recog_destroy(struct ast_speech *speech)
 
         ast_debug(1, "(%s) Destroy speech resource\n", vs->name);
 
-        /*
-         * Detach + close websocket FIRST to break any in-flight I/O,
-         * then wait for active_calls to drain. Never shutdown(fd) yourself.
-         */
+        /* 2. Signal that the engine is closing and stop new WebSocket I/O */
         ast_mutex_lock(&vs->lock);
         vs->closing = 1;
-
         ws = vs->ws;
         vs->ws = NULL;
-
         if (ws) {
                 ast_websocket_ref(ws);
         }
@@ -574,32 +565,42 @@ static int vosk_recog_destroy(struct ast_speech *speech)
         if (ws) {
                 /* Serialize EOF/close with any in-flight write/drain */
                 ast_mutex_lock(&vs->ws_io_lock);
+                ast_debug(1, "(%s) Sending EOF to WebSocket %p\n", vs->name, ws);
                 (void) ast_websocket_write_string(ws, eof);
+                ast_debug(1, "(%s) Calling ast_websocket_close on %p\n", vs->name, ws);
                 (void) ast_websocket_close(ws, 1000);
+                ast_debug(1, "(%s) ast_websocket_close returned\n", vs->name);
                 ast_mutex_unlock(&vs->ws_io_lock);
 
-                ast_websocket_unref(ws);
+
+                ast_websocket_unref(ws);  // Remove temp ref from line 570
+                ast_debug(1, "(%s) Unref'd WebSocket %p (temp)\n", vs->name, ws);
+                ast_websocket_unref(ws);  // Remove original creation ref from line 244
+                ast_debug(1, "(%s) Final unref WebSocket %p (creation)\n", vs->name, ws);
                 ws = NULL;
         }
 
-        /* Wait for all in-flight calls to exit */
+        /* 3. Wait for all in-flight calls (vosk_enter/leave) to exit safely */
         ast_mutex_lock(&vs->lock);
         while (vs->active_calls > 0) {
                 ast_cond_wait(&vs->cond, &vs->lock);
         }
 
+        /* 4. NOW it is safe to detach from the core speech object */
+        ast_mutex_lock(&speech->lock);
+        speech->data = NULL;
+        ast_mutex_unlock(&speech->lock);
+
+        /* 5. Final memory cleanup */
         ast_free(vs->last_result);
         vs->last_result = NULL;
-
         ast_free(vs->last_partial_sent);
         vs->last_partial_sent = NULL;
-
         ast_mutex_unlock(&vs->lock);
 
         ast_cond_destroy(&vs->cond);
         ast_mutex_destroy(&vs->lock);
         ast_mutex_destroy(&vs->ws_io_lock);
-
         ast_free(vs);
 
         return 0;
